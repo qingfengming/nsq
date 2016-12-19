@@ -173,6 +173,10 @@ func NewChannel(topicName string, part int, channelName string, chEnd BackendQue
 	return c
 }
 
+func (c *Channel) GetFullName() string {
+	return c.topicName + "-" + strconv.Itoa(c.topicPart) + "-" + c.name
+}
+
 func (c *Channel) GetName() string {
 	return c.name
 }

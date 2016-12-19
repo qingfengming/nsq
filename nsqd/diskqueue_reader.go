@@ -823,7 +823,7 @@ CheckFileOpen:
 		}
 
 		if nsqLog.Level() >= levellogger.LOG_DEBUG {
-			nsqLog.LogDebugf("DISKQUEUE(%s): readOne() opened %s", d.readerMetaName, curFileName)
+			nsqLog.Logf("DISKQUEUE(%s): readOne() opened %s", d.readerMetaName, curFileName)
 		}
 
 		if d.readQueueInfo.EndOffset.Pos > 0 {

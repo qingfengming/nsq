@@ -41,6 +41,7 @@ type IdentifyDataV2 struct {
 	SampleRate          int32  `json:"sample_rate"`
 	UserAgent           string `json:"user_agent"`
 	MsgTimeout          int    `json:"msg_timeout"`
+	Multiplexing        bool   `json:"multiplexing"`
 }
 
 type identifyEvent struct {
@@ -85,9 +86,10 @@ type ClientV2 struct {
 
 	MsgTimeout time.Duration
 
-	State          int32
-	ConnectTime    time.Time
-	Channel        *Channel
+	State       int32
+	ConnectTime time.Time
+	//Channel        *Channel
+	Channels       map[int]*Channel
 	ReadyStateChan chan int
 	// this is only used by notify messagebump to quit
 	// and should be closed by the read loop only
@@ -114,9 +116,10 @@ type ClientV2 struct {
 	tlsConfig   *tls.Config
 	EnableTrace bool
 
-	PubTimeout *time.Timer
-	remoteAddr string
-	subErrCnt  int64
+	PubTimeout   *time.Timer
+	remoteAddr   string
+	subErrCnt    int64
+	multiplexing bool
 }
 
 func NewClientV2(id int64, conn net.Conn, opts *Options, tls *tls.Config) *ClientV2 {
@@ -156,6 +159,7 @@ func NewClientV2(id int64, conn net.Conn, opts *Options, tls *tls.Config) *Clien
 		HeartbeatInterval: opts.ClientTimeout / 2,
 		tlsConfig:         tls,
 		PubTimeout:        time.NewTimer(time.Second * 5),
+		Channels:          make(map[int]*Channel),
 	}
 	c.LenSlice = c.lenBuf[:]
 	c.remoteAddr = identifier
@@ -170,6 +174,70 @@ func (c *ClientV2) Exit() {
 	atomic.StoreInt64(&c.InFlightCount, 0)
 	c.Conn.Close()
 	nsqLog.Logf("client [%s] force exit", c)
+}
+
+func (c *ClientV2) IsMultiplexing() bool {
+	c.metaLock.RLock()
+	defer c.metaLock.RUnlock()
+	return c.multiplexing
+}
+
+func (c *ClientV2) HasAnySubChannel() bool {
+	c.metaLock.RLock()
+	any := len(c.Channels)
+	c.metaLock.RUnlock()
+	return any > 0
+}
+
+func (c *ClientV2) AddSubChannel(ch *Channel) bool {
+	c.metaLock.Lock()
+	isValid := true
+	for _, subCh := range c.Channels {
+		if subCh.GetTopicName() != ch.GetTopicName() {
+			isValid = false
+		}
+		if subCh.GetName() != ch.GetName() {
+			isValid = false
+		}
+	}
+	if isValid {
+		c.Channels[ch.GetTopicPart()] = ch
+	}
+	c.metaLock.Unlock()
+	return isValid
+}
+
+func (c *ClientV2) RemoveSubChannel(part int) {
+	c.metaLock.Lock()
+	delete(c.Channels, part)
+	c.metaLock.Unlock()
+}
+
+func (c *ClientV2) GetSubChannel(part int) (*Channel, bool) {
+	c.metaLock.Lock()
+	ch, ok := c.Channels[part]
+	c.metaLock.Unlock()
+	return ch, ok
+}
+
+func (c *ClientV2) GetFirstSubChannel() *Channel {
+	var ch *Channel
+	c.metaLock.RLock()
+	for _, channel := range c.Channels {
+		ch = channel
+		break
+	}
+	c.metaLock.RUnlock()
+	return ch
+}
+
+func (c *ClientV2) HandleChannelsBeforeClose() {
+	c.metaLock.RLock()
+	for _, ch := range c.Channels {
+		ch.RequeueClientMessages(c.ID, c.String())
+		ch.RemoveClient(c.ID)
+	}
+	c.metaLock.RUnlock()
 }
 
 func (c *ClientV2) FinalClose() {
@@ -224,6 +292,7 @@ func (c *ClientV2) Identify(data IdentifyDataV2) error {
 	c.ClientID = clientID
 	c.Hostname = hostname
 	c.UserAgent = data.UserAgent
+	c.multiplexing = data.Multiplexing
 	c.metaLock.Unlock()
 
 	err := c.SetHeartbeatInterval(data.HeartbeatInterval)
@@ -371,7 +440,16 @@ func (p *prettyConnectionState) GetVersion() string {
 }
 
 func (c *ClientV2) IsReadyForMessages() bool {
-	if c.Channel.IsPaused() {
+	isAnyChannelReady := false
+	c.metaLock.RLock()
+	for _, ch := range c.Channels {
+		if !ch.IsPaused() {
+			isAnyChannelReady = true
+			break
+		}
+	}
+	c.metaLock.RUnlock()
+	if !isAnyChannelReady {
 		return false
 	}
 

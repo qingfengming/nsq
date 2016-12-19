@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/absolute8511/go-nsq"
+	"github.com/absolute8511/nsq/consistence"
 	"github.com/absolute8511/nsq/internal/levellogger"
 	"github.com/absolute8511/nsq/internal/protocol"
 	"github.com/absolute8511/nsq/internal/test"
@@ -53,6 +54,28 @@ func identify(t *testing.T, conn io.ReadWriter, extra map[string]interface{}, f 
 	return data
 }
 
+func identifyMultiplexing(t *testing.T, conn io.ReadWriter, extra map[string]interface{}, f int32) []byte {
+	ci := make(map[string]interface{})
+	ci["client_id"] = "test"
+	ci["hostname"] = "test"
+	ci["feature_negotiation"] = true
+	ci["multiplexing"] = true
+	if extra != nil {
+		for k, v := range extra {
+			ci[k] = v
+		}
+	}
+	cmd, _ := nsq.Identify(ci)
+	_, err := cmd.WriteTo(conn)
+	test.Equal(t, err, nil)
+	resp, err := nsq.ReadResponse(conn)
+	test.Equal(t, err, nil)
+	frameType, data, err := nsq.UnpackResponse(resp)
+	test.Equal(t, err, nil)
+	test.Equal(t, frameType, f)
+	return data
+}
+
 func sub(t *testing.T, conn io.ReadWriter, topicName string, channelName string) {
 	_, err := nsq.Subscribe(topicName, channelName).WriteTo(conn)
 	test.Equal(t, err, nil)
@@ -63,6 +86,12 @@ func subOrdered(t *testing.T, conn io.ReadWriter, topicName string, channelName 
 	_, err := nsq.SubscribeOrdered(topicName, channelName, "0").WriteTo(conn)
 	test.Equal(t, err, nil)
 	readValidate(t, conn, frameTypeResponse, "OK")
+}
+
+func subOrderedWithPart(t *testing.T, conn io.ReadWriter, topicName string, channelName string, part string) {
+	_, err := nsq.SubscribeOrdered(topicName, channelName, part).WriteTo(conn)
+	test.Equal(t, err, nil)
+	//readValidate(t, conn, frameTypeResponse, "OK")
 }
 
 func subTrace(t *testing.T, conn io.ReadWriter, topicName string, channelName string) {
@@ -1013,6 +1042,159 @@ func TestSubOrderedMulti(t *testing.T) {
 	test.NotEqual(t, frameTypeError, frameType)
 
 	conn.Close()
+}
+
+func TestSubOrderedMultiWithMultiplexing(t *testing.T) {
+	topicName := "test_sub_ordered_multi_multiplexing" + strconv.Itoa(int(time.Now().Unix()))
+
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	opts.LogLevel = 3
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+
+	topic0 := nsqd.GetTopic(topicName, 0)
+	topic0.GetChannel("ordered_ch")
+	conf := nsqdNs.TopicDynamicConf{
+		SyncEvery:    1,
+		AutoCommit:   1,
+		OrderedMulti: true,
+	}
+	logPath0 := consistence.GetTopicPartitionBasePath(opts.DataPath, topicName, 0)
+	logMgr0, _ := consistence.InitTopicCommitLogMgr(topicName, 0, logPath0, 0)
+	topic0.SetDynamicInfo(conf, logMgr0)
+	topic1 := nsqd.GetTopic(topicName, 1)
+	topic1.GetChannel("ordered_ch")
+	logPath1 := consistence.GetTopicPartitionBasePath(opts.DataPath, topicName, 1)
+	logMgr1, _ := consistence.InitTopicCommitLogMgr(topicName, 1, logPath1, 0)
+	topic1.SetDynamicInfo(conf, logMgr1)
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	defer conn.Close()
+	test.Equal(t, err, nil)
+	identifyMultiplexing(t, conn, nil, frameTypeResponse)
+	subOrderedWithPart(t, conn, topicName, "ordered_ch", "0")
+	subOrderedWithPart(t, conn, topicName, "ordered_ch", "1")
+	_, err = nsq.Ready(1).WriteTo(conn)
+	test.Equal(t, err, nil)
+	resp, err := nsq.ReadResponse(conn)
+	test.Nil(t, err)
+	frameType, _, err := nsq.UnpackResponse(resp)
+	test.Nil(t, err)
+	test.NotEqual(t, frameTypeError, frameType)
+
+	msg := nsqdNs.NewMessage(0, make([]byte, 100))
+	for i := 0; i < 100; i++ {
+		topic0.PutMessage(nsqdNs.NewMessage(0, make([]byte, 100)))
+		topic1.PutMessage(nsqdNs.NewMessage(0, make([]byte, 100)))
+	}
+
+	expectedOffset0 := int64(0)
+	expectedOffset1 := int64(0)
+	var lastMsgID0 nsq.NewMessageID
+	var lastMsgID1 nsq.NewMessageID
+	for i := 0; i < 100; i++ {
+		resp, _ := nsq.ReadResponse(conn)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.NotEqual(t, frameTypeError, frameType)
+		if frameType == frameTypeResponse {
+			t.Logf("got response data: %v", string(data))
+			continue
+		}
+		msgOut, err := nsq.DecodeMessage(data)
+
+		msgOut.Offset = uint64(binary.BigEndian.Uint64(msgOut.Body[:8]))
+		msgOut.RawSize = uint32(binary.BigEndian.Uint32(msgOut.Body[8:12]))
+		msgOut.Body = msgOut.Body[12:]
+		test.Equal(t, msgOut.Body, msg.Body)
+		pid := getPartitionIDFromMessageID(nsqdNs.MessageID(nsq.GetNewMessageID(msgOut.ID[:])))
+		test.Equal(t, pid == 0 || pid == 1, true)
+		if pid == 0 {
+			if expectedOffset0 != int64(0) {
+				if nsq.GetNewMessageID(msgOut.ID[:]) != lastMsgID0 {
+					test.Equal(t, expectedOffset0, int64(msgOut.Offset))
+				} else {
+					t.Logf("got dump message id: %v", lastMsgID0)
+				}
+			}
+		} else if pid == 1 {
+			if expectedOffset1 != int64(0) {
+				if nsq.GetNewMessageID(msgOut.ID[:]) != lastMsgID1 {
+					test.Equal(t, expectedOffset1, int64(msgOut.Offset))
+				} else {
+					t.Logf("got dump message id: %v", lastMsgID1)
+				}
+			}
+
+		}
+		if pid == 0 {
+			expectedOffset0 = int64(msgOut.Offset) + int64(msgOut.RawSize)
+			lastMsgID0 = nsq.GetNewMessageID(msgOut.ID[:])
+		} else if pid == 1 {
+			expectedOffset1 = int64(msgOut.Offset) + int64(msgOut.RawSize)
+			lastMsgID1 = nsq.GetNewMessageID(msgOut.ID[:])
+		}
+		_, err = nsq.Finish(msgOut.ID).WriteTo(conn)
+		test.Nil(t, err)
+	}
+	conn.Close()
+	time.Sleep(time.Second)
+	// reconnect and try consume the message
+	conn, err = mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+	identifyMultiplexing(t, conn, nil, frameTypeResponse)
+	subOrderedWithPart(t, conn, topicName, "ordered_ch", "0")
+	subOrderedWithPart(t, conn, topicName, "ordered_ch", "1")
+	_, err = nsq.Ready(1).WriteTo(conn)
+	test.Equal(t, err, nil)
+	defer conn.Close()
+	for i := 0; i < 100; i++ {
+		resp, _ := nsq.ReadResponse(conn)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.NotEqual(t, frameTypeError, frameType)
+		if frameType == frameTypeResponse {
+			t.Logf("got response data: %v", string(data))
+			continue
+		}
+
+		msgOut, err := nsq.DecodeMessage(data)
+		msgOut.Offset = uint64(binary.BigEndian.Uint64(msgOut.Body[:8]))
+		msgOut.RawSize = uint32(binary.BigEndian.Uint32(msgOut.Body[8:12]))
+		msgOut.Body = msgOut.Body[12:]
+		test.Equal(t, msgOut.Body, msg.Body)
+		pid := getPartitionIDFromMessageID(nsqdNs.MessageID(nsq.GetNewMessageID(msgOut.ID[:])))
+		test.Equal(t, pid == 0 || pid == 1, true)
+		if pid == 0 {
+			if expectedOffset0 != int64(0) {
+				if nsq.GetNewMessageID(msgOut.ID[:]) != lastMsgID0 {
+					test.Equal(t, expectedOffset0, int64(msgOut.Offset))
+				} else {
+					t.Logf("got dump message id: %v", lastMsgID0)
+				}
+			}
+		} else if pid == 1 {
+			if expectedOffset1 != int64(0) {
+				if nsq.GetNewMessageID(msgOut.ID[:]) != lastMsgID1 {
+					test.Equal(t, expectedOffset1, int64(msgOut.Offset))
+				} else {
+					t.Logf("got dump message id: %v", lastMsgID1)
+				}
+			}
+
+		}
+		if pid == 0 {
+			expectedOffset0 = int64(msgOut.Offset) + int64(msgOut.RawSize)
+			lastMsgID0 = nsq.GetNewMessageID(msgOut.ID[:])
+		} else if pid == 1 {
+			expectedOffset1 = int64(msgOut.Offset) + int64(msgOut.RawSize)
+			lastMsgID1 = nsq.GetNewMessageID(msgOut.ID[:])
+		}
+		_, err = nsq.Finish(msgOut.ID).WriteTo(conn)
+		test.Nil(t, err)
+	}
 }
 
 func TestSubOrdered(t *testing.T) {

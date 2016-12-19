@@ -319,7 +319,7 @@ CheckFileOpen:
 			return result
 		}
 
-		nsqLog.Logf("DISKQUEUE(%s): readOne() opened %s", d.readFrom, curFileName)
+		nsqLog.LogDebugf("DISKQUEUE(%s): readOne() opened %s", d.readFrom, curFileName)
 
 		if d.readPos.EndOffset.Pos > 0 {
 			_, result.Err = d.readFile.Seek(d.readPos.EndOffset.Pos, 0)

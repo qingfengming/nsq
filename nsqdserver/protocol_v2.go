@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -61,6 +62,7 @@ var offsetMsgCountType = "msgcount"
 var (
 	ErrOrderChannelOnSampleRate = errors.New("order consume is not allowed while sample rate is not 0")
 	ErrPubToWaitTimeout         = errors.New("pub to wait channel timeout")
+	errInvalidCmdInMultiplexing = errors.New("invalid command under multiplexing mode")
 )
 
 type protocolV2 struct {
@@ -133,10 +135,23 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	// could have changed or disabled said attributes)
 	messagePumpStartedChan := make(chan bool)
 	msgPumpStoppedChan := make(chan bool)
-	go p.messagePump(client, messagePumpStartedChan, msgPumpStoppedChan)
+	switchMultiplexC := make(chan bool)
+	go p.messagePump(client, messagePumpStartedChan, msgPumpStoppedChan, switchMultiplexC)
 	<-messagePumpStartedChan
+	multiplexing := false
 
 	for {
+		if !multiplexing && client.IsMultiplexing() {
+			// multiplex subscribe can only be used for the ordered topic channel consume
+			multiplexing = true
+			close(switchMultiplexC)
+			<-msgPumpStoppedChan
+			nsqd.NsqLogger().Logf("switch client to multiplexing : %v", client.String())
+			messagePumpStartedChan = make(chan bool)
+			msgPumpStoppedChan = make(chan bool)
+			go p.multiplexMessagePump(client, messagePumpStartedChan, msgPumpStoppedChan)
+			<-messagePumpStartedChan
+		}
 		if client.HeartbeatInterval > 0 {
 			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2))
 		} else {
@@ -259,10 +274,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	p.ctx.nsqd.CleanClientPubStats(client.RemoteAddr().String(), "tcp")
 	<-msgPumpStoppedChan
 
-	if client.Channel != nil {
-		client.Channel.RequeueClientMessages(client.ID, client.String())
-		client.Channel.RemoveClient(client.ID)
-	}
+	client.HandleChannelsBeforeClose()
 	client.FinalClose()
 
 	return err
@@ -406,8 +418,158 @@ func (p *protocolV2) Exec(client *nsqd.ClientV2, params [][]byte) ([]byte, error
 	return nil, protocol.NewFatalClientErr(nil, E_INVALID, fmt.Sprintf("invalid command %v", params[0]))
 }
 
-func (p *protocolV2) messagePump(client *nsqd.ClientV2, startedChan chan bool,
+func (p *protocolV2) pumpSingleOrderedChannel(client *nsqd.ClientV2, subChannel *nsqd.Channel, stopChan chan struct{}) error {
+	var err error
+	var buf bytes.Buffer
+	var clientMsgChan chan *nsqd.Message
+	msgTimeout := client.MsgTimeout
+	// for ordered channel, we always wait on message channel, because
+	// the channel will only read message to client after the last message is confirmed
+	clientMsgChan = subChannel.GetClientMsgChan()
+
+	for {
+		select {
+		case <-stopChan:
+			return nil
+		case msg, ok := <-clientMsgChan:
+			if !ok {
+				return nil
+			}
+			// avoid re-send some confirmed message,
+			// this may happen while the channel reader is reset to old position
+			// due to some retry or leader change.
+			if subChannel.IsConfirmed(msg) {
+				continue
+			}
+
+			subChannel.StartInFlightTimeout(msg, client.ID, client.String(), msgTimeout)
+			client.SendingMessage()
+			err = SendMessage(client, msg, &buf, subChannel.IsOrdered())
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *protocolV2) multiplexMessagePump(client *nsqd.ClientV2, startedChan chan bool,
 	stoppedChan chan bool) {
+	var err error
+	// NOTE: `flusherChan` is used to bound message latency for
+	// the pathological case of a channel on a low volume topic
+	// with >1 clients having >1 RDY counts
+	var flusherChan <-chan time.Time
+
+	subEventChan := client.SubEventChan
+	identifyEventChan := client.IdentifyEventChan
+	outputBufferTicker := time.NewTicker(client.OutputBufferTimeout)
+	heartbeatTicker := time.NewTicker(client.HeartbeatInterval)
+	heartbeatChan := heartbeatTicker.C
+	heartbeatFailedCnt := 0
+	multiplexStopC := make(chan struct{})
+
+	// v2 opportunistically buffers data to clients to reduce write system calls
+	// we force flush in two cases:
+	//    1. when the client is not ready to receive messages
+	//    2. we're buffered and the channel has nothing left to send us
+	//       (ie. we would block in this loop anyway)
+	//
+	shouldExitC := make(chan error)
+
+	// signal to the goroutine that started the messagePump
+	// that we've started up
+	close(startedChan)
+	var wg sync.WaitGroup
+	for {
+		flusherChan = outputBufferTicker.C
+		select {
+		case <-client.ExitChan:
+			goto exit
+		case chErr := <-shouldExitC:
+			err = chErr
+			client.Exit()
+			goto exit
+		case <-flusherChan:
+			// if this case wins, we're either starved
+			// or we won the race between other channels...
+			// in either case, force flush
+			client.LockWrite()
+			err = client.Flush()
+			client.UnlockWrite()
+			if err != nil {
+				goto exit
+			}
+		case subChannel := <-subEventChan:
+			// you can't SUB anymore
+			nsqd.NsqLogger().Logf("client %v sub to channel: %v", client.ID,
+				subChannel.GetFullName())
+			if !subChannel.IsOrdered() {
+				err = fmt.Errorf("multiplexing on unordered channel: %v for client: %v",
+					subChannel.GetName(), client.String())
+				// force client exit
+				client.Exit()
+				goto exit
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				chErr := p.pumpSingleOrderedChannel(client, subChannel, multiplexStopC)
+				if chErr != nil {
+					nsqd.NsqLogger().LogWarningf("pump channel return error: %v", err)
+				} else {
+					nsqd.NsqLogger().Logf("pump channel closed from client: %v", client.String())
+				}
+				select {
+				case shouldExitC <- chErr:
+				default:
+				}
+			}()
+		case identifyData := <-identifyEventChan:
+			// you can't IDENTIFY anymore
+			identifyEventChan = nil
+
+			outputBufferTicker.Stop()
+			if identifyData.OutputBufferTimeout > 0 {
+				outputBufferTicker = time.NewTicker(identifyData.OutputBufferTimeout)
+			}
+
+			heartbeatTicker.Stop()
+			heartbeatChan = nil
+			if identifyData.HeartbeatInterval > 0 {
+				heartbeatTicker = time.NewTicker(identifyData.HeartbeatInterval)
+				heartbeatChan = heartbeatTicker.C
+			}
+		case <-heartbeatChan:
+			err = Send(client, frameTypeResponse, heartbeatBytes)
+			nsqd.NsqLogger().LogDebugf("PROTOCOL(V2): [%s] send heartbeat", client)
+			if err != nil {
+				heartbeatFailedCnt++
+				nsqd.NsqLogger().LogWarningf("PROTOCOL(V2): [%s] send heartbeat failed %v times, %v", client, heartbeatFailedCnt, err)
+				if heartbeatFailedCnt > 2 {
+					goto exit
+				}
+			} else {
+				heartbeatFailedCnt = 0
+			}
+		}
+	}
+
+exit:
+
+	close(multiplexStopC)
+	wg.Wait()
+	nsqd.NsqLogger().LogDebugf("PROTOCOL(V2): [%s] exiting messagePump", client)
+	heartbeatTicker.Stop()
+	outputBufferTicker.Stop()
+	if err != nil {
+		nsqd.NsqLogger().Logf("PROTOCOL(V2): [%s] messagePump error - %s", client, err)
+	}
+	close(stoppedChan)
+}
+
+func (p *protocolV2) messagePump(client *nsqd.ClientV2, startedChan chan bool,
+	stoppedChan chan bool, switchMultiplexC chan bool) {
 	var err error
 	var buf bytes.Buffer
 	var clientMsgChan chan *nsqd.Message
@@ -464,6 +626,8 @@ func (p *protocolV2) messagePump(client *nsqd.ClientV2, startedChan chan bool,
 		}
 
 		select {
+		case <-switchMultiplexC:
+			goto exit
 		case <-client.ExitChan:
 			goto exit
 		case <-flusherChan:
@@ -827,8 +991,10 @@ func (p *protocolV2) internalSUB(client *nsqd.ClientV2, params [][]byte, enableT
 
 	state := atomic.LoadInt32(&client.State)
 	if state != stateInit {
-		nsqd.NsqLogger().LogWarningf("[%s] command in wrong state: %v", client, state)
-		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "cannot SUB in current state")
+		if !ordered || !client.IsMultiplexing() || state != stateSubscribed {
+			nsqd.NsqLogger().LogWarningf("[%s] command in wrong state: %v", client, state)
+			return nil, protocol.NewFatalClientErr(nil, E_INVALID, "cannot SUB in current state")
+		}
 	}
 
 	if client.HeartbeatInterval <= 0 {
@@ -892,7 +1058,10 @@ func (p *protocolV2) internalSUB(client *nsqd.ClientV2, params [][]byte, enableT
 	}
 
 	atomic.StoreInt32(&client.State, stateSubscribed)
-	client.Channel = channel
+	if !client.AddSubChannel(channel) {
+		nsqd.NsqLogger().Logf("sub failed to add channel to client: %v, %v", client, channel.GetFullName())
+		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "client add sub channel failed")
+	}
 	if enableTrace {
 		nsqd.NsqLogger().Logf("sub channel %v with trace enabled, remote is : %v", channelName, client.RemoteAddr())
 	}
@@ -983,21 +1152,32 @@ func (p *protocolV2) FIN(client *nsqd.ClientV2, params [][]byte) ([]byte, error)
 		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "Invalid Message ID")
 	}
 
-	if client.Channel == nil {
+	var channel *nsqd.Channel
+	if client.IsMultiplexing() {
+		pid := getPartitionIDFromMessageID(msgID)
+		var ok bool
+		channel, ok = client.GetSubChannel(pid)
+		if !ok {
+			nsqd.NsqLogger().Logf("failed to get sub channel from: %v", pid)
+		}
+	} else {
+		channel = client.GetFirstSubChannel()
+	}
+	if channel == nil {
 		nsqd.NsqLogger().LogDebugf("FIN error no channel: %v", msgID)
 		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "No channel")
 	}
 
-	if !p.ctx.checkForMasterWrite(client.Channel.GetTopicName(), client.Channel.GetTopicPart()) {
-		nsqd.NsqLogger().Logf("topic %v fin message failed for not leader", client.Channel.GetTopicName())
+	if !p.ctx.checkForMasterWrite(channel.GetTopicName(), channel.GetTopicPart()) {
+		nsqd.NsqLogger().Logf("topic %v fin message failed for not leader", channel.GetTopicName())
 		return nil, protocol.NewFatalClientErr(nil, FailedOnNotLeader, "")
 	}
 
-	err = p.ctx.FinishMessage(client.Channel, client.ID, client.String(), msgID)
+	err = p.ctx.FinishMessage(channel, client.ID, client.String(), msgID)
 	if err != nil {
 		client.IncrSubError(int64(1))
 		nsqd.NsqLogger().LogDebugf("FIN error : %v, err: %v, channel: %v, topic: %v", msgID,
-			err, client.Channel.GetName(), client.Channel.GetTopicName())
+			err, channel.GetName(), channel.GetTopicName())
 		if clusterErr, ok := err.(*consistence.CommonCoordErr); ok {
 			if !clusterErr.IsLocalErr() {
 				return nil, protocol.NewFatalClientErr(err, FailedOnNotWritable, "")
@@ -1039,10 +1219,21 @@ func (p *protocolV2) REQ(client *nsqd.ClientV2, params [][]byte) ([]byte, error)
 			fmt.Sprintf("REQ timeout %v out of range 0-%v", timeoutDuration, p.ctx.getOpts().MaxReqTimeout))
 	}
 
-	if client.Channel == nil {
+	var channel *nsqd.Channel
+	if client.IsMultiplexing() {
+		var ok bool
+		pid := getPartitionIDFromMessageID(nsqd.GetMessageIDFromFullMsgID(*id))
+		channel, ok = client.GetSubChannel(pid)
+		if !ok {
+			nsqd.NsqLogger().Logf("get sub channel failed from %v", pid)
+		}
+	} else {
+		channel = client.GetFirstSubChannel()
+	}
+	if channel == nil {
 		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "No channel")
 	}
-	err = client.Channel.RequeueMessage(client.ID, client.String(), nsqd.GetMessageIDFromFullMsgID(*id), timeoutDuration, true)
+	err = channel.RequeueMessage(client.ID, client.String(), nsqd.GetMessageIDFromFullMsgID(*id), timeoutDuration, true)
 	if err != nil {
 		client.IncrSubError(int64(1))
 		return nil, protocol.NewClientErr(err, "E_REQ_FAILED",
@@ -1371,11 +1562,22 @@ func (p *protocolV2) TOUCH(client *nsqd.ClientV2, params [][]byte) ([]byte, erro
 	client.LockRead()
 	msgTimeout := client.MsgTimeout
 	client.UnlockRead()
+	var channel *nsqd.Channel
+	if client.IsMultiplexing() {
+		var ok bool
+		pid := getPartitionIDFromMessageID(nsqd.GetMessageIDFromFullMsgID(*id))
+		channel, ok = client.GetSubChannel(pid)
+		if !ok {
+			nsqd.NsqLogger().Logf("get sub channel failed from %v", pid)
+		}
+	} else {
+		channel = client.GetFirstSubChannel()
+	}
 
-	if client.Channel == nil {
+	if channel == nil {
 		return nil, protocol.NewFatalClientErr(nil, E_INVALID, "No channel")
 	}
-	err = client.Channel.TouchMessage(client.ID, nsqd.GetMessageIDFromFullMsgID(*id), msgTimeout)
+	err = channel.TouchMessage(client.ID, nsqd.GetMessageIDFromFullMsgID(*id), msgTimeout)
 	if err != nil {
 		return nil, protocol.NewClientErr(err, "E_TOUCH_FAILED",
 			fmt.Sprintf("TOUCH %v failed %s", *id, err.Error()))
@@ -1449,6 +1651,10 @@ func getFullMessageID(p []byte) (*nsqd.FullMessageID, error) {
 		return nil, errors.New("Invalid Message ID")
 	}
 	return (*nsqd.FullMessageID)(unsafe.Pointer(&p[0])), nil
+}
+
+func getPartitionIDFromMessageID(id nsqd.MessageID) int {
+	return int(uint64(id) >> consistence.MAX_INCR_ID_BIT)
 }
 
 func readLen(r io.Reader, tmp []byte) (int32, error) {
