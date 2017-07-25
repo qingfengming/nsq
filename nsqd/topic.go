@@ -62,9 +62,9 @@ type PubInfo struct {
 type PubInfoChan chan *PubInfo
 
 type ChannelMetaInfo struct {
-	Name   string `json:"name"`
-	Paused bool   `json:"paused"`
-	Skipped bool  `json:"skipped"`
+	Name    string `json:"name"`
+	Paused  bool   `json:"paused"`
+	Skipped bool   `json:"skipped"`
 }
 
 type Topic struct {
@@ -369,6 +369,25 @@ func (t *Topic) LoadChannelMeta() error {
 	return nil
 }
 
+func (t *Topic) GetChannelMeta() []ChannelMetaInfo {
+	t.channelLock.RLock()
+	channels := make([]ChannelMetaInfo, 0, len(t.channelMap))
+	for _, channel := range t.channelMap {
+		channel.RLock()
+		if !channel.ephemeral {
+			meta := ChannelMetaInfo{
+				Name:    channel.name,
+				Paused:  channel.IsPaused(),
+				Skipped: channel.IsSkipped(),
+			}
+			channels = append(channels, meta)
+		}
+		channel.RUnlock()
+	}
+	t.channelLock.RUnlock()
+	return channels
+}
+
 func (t *Topic) SaveChannelMeta() error {
 	fileName := t.getChannelMetaFileName()
 	channels := make([]*ChannelMetaInfo, 0)
@@ -377,8 +396,8 @@ func (t *Topic) SaveChannelMeta() error {
 		channel.RLock()
 		if !channel.ephemeral {
 			meta := &ChannelMetaInfo{
-				Name:   channel.name,
-				Paused: channel.IsPaused(),
+				Name:    channel.name,
+				Paused:  channel.IsPaused(),
 				Skipped: channel.IsSkipped(),
 			}
 			channels = append(channels, meta)

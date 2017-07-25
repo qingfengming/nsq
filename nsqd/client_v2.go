@@ -15,7 +15,7 @@ import (
 	"github.com/golang/snappy"
 )
 
-const defaultBufferSize = 8 * 1024
+const defaultBufferSize = 4 * 1024
 const slowDownThreshold = 5
 
 const (

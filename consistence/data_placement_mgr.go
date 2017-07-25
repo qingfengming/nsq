@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"github.com/absolute8511/nsq/nsqd"
 	"math"
 	"sort"
 	"strconv"
@@ -139,6 +140,7 @@ type NodeTopicStats struct {
 	TopicHourlyPubDataList map[string][24]int64
 	ChannelNum             map[string]int
 	ChannelList            map[string][]string
+	ChannelMetas           map[string][]nsqd.ChannelMetaInfo
 }
 
 func NewNodeTopicStats(nid string, cap int, cpus int) *NodeTopicStats {
@@ -150,6 +152,7 @@ func NewNodeTopicStats(nid string, cap int, cpus int) *NodeTopicStats {
 		TopicHourlyPubDataList: make(map[string][24]int64, cap),
 		ChannelNum:             make(map[string]int, cap),
 		ChannelList:            make(map[string][]string),
+		ChannelMetas:           make(map[string][]nsqd.ChannelMetaInfo),
 		NodeCPUs:               cpus,
 	}
 }

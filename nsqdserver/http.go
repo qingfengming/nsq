@@ -599,7 +599,7 @@ func (s *httpServer) doSkipChannel(w http.ResponseWriter, req *http.Request, ps 
 	}
 
 	// pro-actively persist metadata so in case of process failure
-	s.ctx.persistMetadata()
+	topic.SaveChannelMeta()
 	return nil, nil
 }
 
@@ -626,7 +626,7 @@ func (s *httpServer) doPauseChannel(w http.ResponseWriter, req *http.Request, ps
 	}
 
 	// pro-actively persist metadata so in case of process failure
-	s.ctx.persistMetadata()
+	topic.SaveChannelMeta()
 	return nil, nil
 }
 

@@ -568,6 +568,7 @@ func (self *NsqdCoordRpcServer) GetTopicStats(topic string) *NodeTopicStats {
 				chList = append(chList, chStat.ChannelName)
 			}
 			stat.ChannelList[ts.TopicFullName] = chList
+			stat.ChannelMetas[ts.TopicFullName] = localTopic.GetChannelMeta()
 		}
 	}
 	// the status of specific topic
@@ -587,8 +588,8 @@ type RpcTopicData struct {
 type RpcChannelState struct {
 	RpcTopicData
 	Channel string
-	Paused int
-	Skipped   int
+	Paused  int
+	Skipped int
 }
 
 type RpcChannelOffsetArg struct {
