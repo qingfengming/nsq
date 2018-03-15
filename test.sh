@@ -1,14 +1,15 @@
 #!/bin/bash
 set -e
-echo "" > coverage.txt
+echo "mode: atomic" > coverage.txt
+echo "" > go_test.txt
 
 if [ "$TEST_RACE" = "false" ]; then
     GOMAXPROCS=1 go test -timeout 900s `go list ./... | grep -v consistence | grep -v nsqadmin`
 else
     for d in $(go list ./... | grep -v consistence | grep -v nsqadmin); do
-        GOMAXPROCS=4 go test -timeout 900s -race -coverprofile=profile.out -covermode=atomic $d
+        GOMAXPROCS=4 go test -timeout 900s -race -coverprofile=profile.out $d | tee -a go_test.txt
         if [ -f profile.out ]; then
-            cat profile.out >> coverage.txt
+            cat profile.out | grep -v "mode: atomic" >> coverage.txt
             rm profile.out
         fi
     done

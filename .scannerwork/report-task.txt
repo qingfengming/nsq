@@ -1,0 +1,6 @@
+projectKey=nsq
+serverUrl=http://10.9.74.29:7001
+serverVersion=6.5.0.27846
+dashboardUrl=http://10.9.74.29:7001/dashboard/index/nsq
+ceTaskId=AWIplqkMYsZZs-fWtkpD
+ceTaskUrl=http://10.9.74.29:7001/api/ce/task?id=AWIplqkMYsZZs-fWtkpD

@@ -34,6 +34,7 @@ $(APPS): %: $(BLDDIR)/%
 
 clean:
 	rm -fr $(BLDDIR)
+	rm -fr go_test.txt coverage.txt coverage.xml test.xml report.xml
 
 .PHONY: install clean all
 .PHONY: $(APPS)
@@ -41,3 +42,8 @@ clean:
 install: $(APPS)
 	install -m 755 -d ${DESTDIR}${BINDIR}
 	for APP in $^ ; do install -m 755 ${BLDDIR}/$$APP ${DESTDIR}${BINDIR}/$$APP${EXT} ; done
+
+sonar_scanner_ready: go_test.txt coverage.txt
+	gocov convert coverage.txt | gocov-xml >coverage.xml
+	go-junit-report <go_test.txt >test.xml
+	gometalinter --checkstyle -D test -D testify -D gas -D gosimple -D staticcheck -D structcheck -j 4 -e '_test\.go' nsqadmin nsqd nsqdserver nsqlookupd nsqlookupd_migrate >report.xml || true
