@@ -1,49 +1,97 @@
 package nsq_sync
 
 import (
-	"github.com/youzan/nsq/internal/http_api"
 	"net"
 	"os"
 	"github.com/youzan/nsq/internal/protocol"
 	"sync"
 	"github.com/youzan/nsq/internal/util"
+	"bytes"
 )
 
 type NsqSync struct {
 	sync.RWMutex
-	opts         *Options
-	TcpListener net.Listener
-	tcpListener  net.Listener
-	httpListener net.Listener
-	waitGroup    util.WaitGroupWrapper
+	opts           *Options
+	TcpListener    net.Listener
+	tcpListener    net.Listener
+	httpListener   net.Listener
+	waitGroup      util.WaitGroupWrapper
+	//sync target map from peer nsq topic sync
+	targetTopicMap map[string]map[int]*TopicInfo
+	//map of topic sync tasks
+	inSyncTopicMap map[string]*TopicSync
 }
 
+type TopicInfo struct {
+	topicName string
+	partition int
+	bp              sync.Pool
+}
 
-func NewNsqSync(opts *Options) *NsqSync {
+func (t *TopicInfo) BufferPoolGet(capacity int) *bytes.Buffer {
+	b := t.bp.Get().(*bytes.Buffer)
+	b.Reset()
+	b.Grow(capacity)
+	return b
+}
+
+func (t *TopicInfo) BufferPoolPut(b *bytes.Buffer) {
+	t.bp.Put(b)
+}
+
+func NewTopicInfo(topicName string, partition int) *TopicInfo{
+	ti := &TopicInfo{
+		topicName:topicName,
+		partition:partition,
+	}
+	ti.bp.New = func() interface{} {
+		return &bytes.Buffer{}
+	}
+	return ti
+}
+
+func New(opts *Options) *NsqSync {
 	n := &NsqSync{
 		opts: opts,
+		targetTopicMap:make(map[string]map[int]*TopicInfo),
 	}
 	return n
 }
 
-func getIPv4ForInterfaceName(ifname string) string {
-	interfaces, _ := net.Interfaces()
-	for _, inter := range interfaces {
-		nsqSyncLog.Logf("found interface: %s", inter.Name)
-		if inter.Name == ifname {
-			if addrs, err := inter.Addrs(); err == nil {
-				for _, addr := range addrs {
-					switch ip := addr.(type) {
-					case *net.IPNet:
-						if ip.IP.DefaultMask() != nil {
-							return ip.IP.String()
-						}
-					}
-				}
-			}
+func (l *NsqSync) getTopic(topicName string, partition int) *TopicInfo {
+	l.RLock()
+	pars, ok := l.targetTopicMap[topicName]
+	if ok {
+		ti, ok := pars[partition]
+		if ok {
+			l.RLock()
+			return ti
 		}
 	}
-	return ""
+	l.RUnlock()
+
+	l.Lock()
+	pars, ok = l.targetTopicMap[topicName]
+	if ok {
+		ti, ok := pars[partition]
+		if ok {
+			l.RLock()
+			return ti
+		}
+	} else {
+		pars = make(map[int]*TopicInfo)
+		l.targetTopicMap[topicName] = pars
+	}
+
+	if partition < 0 {
+		partition = 0
+	}
+	t := NewTopicInfo(topicName, partition)
+	pars[partition] = t
+	nsqSyncLog.Logf("TOPIC(%s:%v): created", t.topicName, t.partition)
+	l.Unlock()
+
+	return t
 }
 
 func (l *NsqSync) Main() {
@@ -62,25 +110,25 @@ func (l *NsqSync) Main() {
 	ctx.peerTcpAddr, err = net.ResolveTCPAddr("tcp", l.opts.PeerNSQSyncTCPAddr)
 	if err != nil {
 		nsqSyncLog.Errorf("fail to parse nsqproxy forward TCP address %v", l.opts.PeerNSQSyncTCPAddr)
-		return;
+		os.Exit(1)
 	}
 	nsqSyncLog.Infof("nsq proxy forward TCP address: %v", ctx.peerTcpAddr.String())
 
 	ctx.httpAddr, err = net.ResolveTCPAddr("tcp", l.opts.HTTPAddress)
 	if err != nil {
 		nsqSyncLog.Errorf("fail to parse nsqproxy HTTP address %v", l.opts.HTTPAddress)
-		return;
+		os.Exit(1)
 	}
 	nsqSyncLog.Infof("nsq proxy HTTP address: %v", ctx.httpAddr.String())
 
 	ctx.peerHttpAddr, err = net.ResolveTCPAddr("tcp", l.opts.PeerNSQSyncHTTPAddr)
 	if err != nil {
-		nsqSyncLog.Errorf("fail to parse forward nsqproxy TCP address %v", l.opts.PeerNSQSyncHTTPAddr)
-		return;
+		nsqSyncLog.Errorf("fail to parse peer nsqproxy TCP address %v", l.opts.PeerNSQSyncHTTPAddr)
+		os.Exit(1)
 	}
 	nsqSyncLog.Infof("peer nsq proxy HTTP address: %v", ctx.peerHttpAddr.String())
 
-	//TODO forward tcp server
+	//tcp server
 	TcpListener, err := net.Listen("tcp", l.opts.TCPAddress)
 	if err != nil {
 		nsqSyncLog.LogErrorf("FATAL: listen (%s) failed - %s", l.opts.TCPAddress, err)
@@ -92,44 +140,32 @@ func (l *NsqSync) Main() {
 	l.Unlock()
 	nsqSyncLog.Logf("TCP: listening on %s", TcpListener.Addr())
 	tcpServer := &tcpServer{ctx: ctx}
-	l.waitGroup.Wrap(func() {
-		protocol.TCPServer(forwardTcpListener, tcpServer)
-		nsqSyncLog.Logf("TCP: closing %s", forwardTcpListener.Addr())
-	})
-
-	tcpListener, err := net.Listen("tcp", l.opts.TCPAddress)
+	//init topic producer
+	err = InitProducerManager(l.opts)
 	if err != nil {
-		nsqSyncLog.LogErrorf("FATAL: listen (%s) failed - %s", l.opts.TCPAddress, err)
+		nsqSyncLog.Errorf("fail to initialize topic producer manager, err: %v", err)
 		os.Exit(1)
 	}
-	l.Lock()
-	l.tcpListener = tcpListener
-	ctx.tcpAddr = tcpListener.Addr().(*net.TCPAddr)
-	l.Unlock()
-	nsqSyncLog.Logf("TCP: listening on %s", tcpListener.Addr())
+
 	l.waitGroup.Wrap(func() {
-		protocol.TCPServer(tcpListener, tcpServer)
-		nsqSyncLog.Logf("TCP: closing %s", tcpListener.Addr())
+		protocol.TCPServer(TcpListener, tcpServer)
+		nsqSyncLog.Logf("TCP: closing %s", TcpListener.Addr())
 	})
 
-
-
-	//HTTP server
-	httpListener, err := net.Listen("tcp", l.opts.HTTPAddress)
-	ctx.httpAddr = httpListener.Addr().(*net.TCPAddr)
-	if err != nil {
-		nsqSyncLog.LogErrorf("FATAL: listen (%s) failed - %s", l.opts.HTTPAddress, err)
-		os.Exit(1)
-	}
-	l.Lock()
-	l.httpListener = httpListener
-	l.Unlock()
-	httpServer := newHTTPServer(ctx, false, l.opts.TLSRequired == nsqd.TLSRequired)
-	l.waitGroup.Wrap(func() {
-		http_api.Serve(httpListener, httpServer, "HTTP", l.opts.Logger)
-	})
-
-	//TODO: listen forward(HTTPS)
+	////TODO: HTTP server
+	//httpListener, err := net.Listen("tcp", l.opts.HTTPAddress)
+	//ctx.httpAddr = httpListener.Addr().(*net.TCPAddr)
+	//if err != nil {
+	//	nsqSyncLog.LogErrorf("FATAL: listen (%s) failed - %s", l.opts.HTTPAddress, err)
+	//	os.Exit(1)
+	//}
+	//l.Lock()
+	//l.httpListener = httpListener
+	//l.Unlock()
+	//httpServer := newHTTPServer(ctx, false, l.opts.TLSRequired == nsqd.TLSRequired)
+	//l.waitGroup.Wrap(func() {
+	//	http_api.Serve(httpListener, httpServer, "HTTP", l.opts.Logger)
+	//})
 }
 
 func (l *NsqSync) RealTCPAddr() *net.TCPAddr {
@@ -156,8 +192,8 @@ func (l *NsqSync) Exit() {
 	if l.tcpListener != nil {
 		l.tcpListener.Close()
 	}
-	if l.forwardTcpListener != nil {
-		l.forwardTcpListener.Close()
+	if l.TcpListener != nil {
+		l.TcpListener.Close()
 	}
 	if l.httpListener != nil {
 		l.httpListener.Close()
@@ -165,8 +201,4 @@ func (l *NsqSync) Exit() {
 
 	l.waitGroup.Wait()
 	nsqSyncLog.Logf("nsqproxy stopped.")
-}
-
-func (l *NsqSync) IsAuthEnabled() bool {
-	return len(l.opts.AuthHTTPAddresses) != 0
 }

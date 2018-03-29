@@ -26,22 +26,24 @@ type TopicSync struct {
 	lookupdHTTPAddrs    []string
 	destNsqdTCPAddrs    []string
 
-	statusEvery int
-	mode string
+	statusEvery *int
+	mode *string
 
 	userAgent string
 	stopChan chan int
 }
 
 func NewTopicSync(topic string, channel string, destTopic string, lookupdHttpAddrs []string, destNsqdTCPAddrs []string) *TopicSync {
+	modeStr := "hostpool"
+	statusEvery := 250
 	return &TopicSync{
 		topic: topic,
 		channel:  channel,
 		destTopic: destTopic,
 		lookupdHTTPAddrs: lookupdHttpAddrs,
 		destNsqdTCPAddrs:destNsqdTCPAddrs,
-		statusEvery: 250,
-		mode: "hostpool",
+		statusEvery: &statusEvery,
+		mode: &modeStr,
 		stopChan: make(chan int, 1),
 	}
 }
@@ -79,13 +81,13 @@ func (c *TopicSync) Connect() error {
 		perAddressStatus[c.destNsqdTCPAddrs[0]] = timer_metrics.NewTimerMetrics(0, "")
 	} else {
 		for _, a := range c.destNsqdTCPAddrs {
-			perAddressStatus[a] = timer_metrics.NewTimerMetrics(c.statusEvery,
+			perAddressStatus[a] = timer_metrics.NewTimerMetrics(*c.statusEvery,
 				fmt.Sprintf("[%s]:", a))
 		}
 	}
 
 	hostPool := hostpool.New(c.destNsqdTCPAddrs)
-	if c.mode == "epsilon-greedy" {
+	if *c.mode == "epsilon-greedy" {
 		hostPool = hostpool.NewEpsilonGreedy(c.destNsqdTCPAddrs, 0, &hostpool.LinearEpsilonValueCalculator{})
 	}
 

@@ -18,10 +18,16 @@ type Options struct {
 	ReadTimeout	  time.Duration `flag:"read-timeout"`
 	WriteTimeout	  time.Duration `flag:"write-timeout"`
 
+	MaxBodySize       int64         `flag:"max-body-size"`
+	MaxRdyCount            int64         `flag:"max-rdy-count"`
+	MaxMsgTimeout     time.Duration `flag:"max-msg-timeout"`
+	MsgTimeout        time.Duration `flag:"msg-timeout" arg:"60s"`
+	MaxMsgSize        int64         `flag:"max-msg-size" deprecated:"max-message-size" cfg:"max_msg_size"`
+
 	//TODO: compression
-	//DeflateEnabled  bool `flag:"deflate"`
-	//MaxDeflateLevel int  `flag:"max-deflate-level"`
-	//SnappyEnabled   bool `flag:"snappy"`
+	DeflateEnabled  bool `flag:"deflate"`
+	MaxDeflateLevel int  `flag:"max-deflate-level"`
+	SnappyEnabled   bool `flag:"snappy"`
 
 	// TLS config
 	TLSCert             string `flag:"tls-cert"`
@@ -45,9 +51,13 @@ func NewOptions() *Options {
 		LogDir:   "",
 		Logger:   &levellogger.GLogger{},
 
+		MaxBodySize:       5 * 1024 * 1024,
 		ConnTimeout: 60*time.Second,
 		ReadTimeout: 60*time.Second,
 		WriteTimeout: 60*time.Second,
+
+		MaxRdyCount: 2500,
+		MaxMsgSize:        1024 * 1024,
 		//TODO: compression settings
 		//DeflateEnabled:  true,
 		//MaxDeflateLevel: 6,

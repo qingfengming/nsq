@@ -68,7 +68,26 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	return bufio.NewWriterSize(w, size)
 }
 
+func NewBufioWriterSize(w io.Writer, size int) *bufio.Writer {
+	pool := bufioWriterPool(size)
+	if pool != nil {
+		if v := pool.Get(); v != nil {
+			bw := v.(*bufio.Writer)
+			bw.Reset(w)
+			return bw
+		}
+	}
+	return bufio.NewWriterSize(w, size)
+}
+
 func putBufioWriter(bw *bufio.Writer) {
+	bw.Reset(nil)
+	if pool := bufioWriterPool(bw.Available()); pool != nil {
+		pool.Put(bw)
+	}
+}
+
+func PutBufioWriter(bw *bufio.Writer) {
 	bw.Reset(nil)
 	if pool := bufioWriterPool(bw.Available()); pool != nil {
 		pool.Put(bw)
